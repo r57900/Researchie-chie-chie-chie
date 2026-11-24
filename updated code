@@ -1,0 +1,849 @@
+import io
+import json
+import shutil
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yaml
+from PIL import Image
+from ultralytics import YOLO
+
+
+APP_DIR = (__file__).resolve().parent
+DATASET_DIR = APP_DIR / "dataset"
+MODEL_DIR = APP_DIR / "models"
+MODEL_PATH = MODEL_DIR / "best.pt"
+RUN_DIR = MODEL_DIR / "training"
+
+MODEL_DIR.mkdir(exist_ok=True)
+
+CLASSES = [
+    "wall_gap_error",
+    "door_window_clash",
+    "unclear_fixture_blur"
+]
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+st.set_page_config(
+    page_title="BlueprintAI",
+    page_icon="📐",
+    layout="wide"
+)
+
+# =====================================================
+# USER INTERFACE DESIGN
+# =====================================================
+
+st.markdown("""
+<style>
+.stApp {
+    background: #0b1020;
+    color: #edf2ff;
+}
+[data-testid="stSidebar"] {
+    background: #111a2e;
+}
+.hero {
+    background: linear-gradient(120deg, #17243d, #10192c);
+    padding: 28px;
+    border-radius: 15px;
+    border: 1px solid #30415f;
+    margin-bottom: 20px;
+}
+.hero h1 {
+    color: white;
+}
+.hero p {
+    color: #b7c5dc;
+}
+div[data-testid="stMetric"] {
+    background: #121d33;
+    padding: 15px;
+    border-radius: 12px;
+    border: 1px solid #273653;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="hero">
+    <h1>📐 BlueprintAI</h1>
+    <p>Machine Learning Blueprint Visual Inspection System</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.warning(
+    "BlueprintAI is an experimental visual inspection tool. "
+    "It does not certify structural safety or replace a licensed engineer."
+)
+
+# =====================================================
+# MODEL LOADING
+# =====================================================
+
+@st.cache_resource
+def load_model(path, modified_time):
+    return YOLO(str(path))
+
+
+def get_model():
+    if not MODEL_PATH.exists():
+        return None
+
+    try:
+        return load_model(
+            str(MODEL_PATH),
+            MODEL_PATH.stat().st_mtime
+        )
+    except Exception as error:
+        st.error(f"Could not load model: {error}")
+        return None
+
+
+# =====================================================
+# DATASET ZIP EXTRACTION
+# =====================================================
+
+def safe_extract_dataset(zip_file):
+    """
+    Extract a YOLO dataset ZIP while preventing
+    ZIP path traversal.
+    """
+
+    temporary_dir = APP_DIR / "dataset_upload"
+    temporary_dir.mkdir(exist_ok=True)
+
+    with zipfile.ZipFile(zip_file) as archive:
+
+        for member in archive.infolist():
+
+            target = (temporary_dir / member.filename).resolve()
+
+            if not target.is_relative_to(temporary_dir.resolve()):
+                raise ValueError(
+                    "The ZIP contains an unsafe file path."
+                )
+
+        archive.extractall(temporary_dir)
+
+    return temporary_dir
+
+
+def find_dataset_root(folder):
+    """
+    Locate the directory containing train/images
+    and train/labels, even if the ZIP has an
+    additional parent folder.
+    """
+
+    for candidate in [folder] + list(folder.rglob("*")):
+
+        if not candidate.is_dir():
+            continue
+
+        train_images = candidate / "train" / "images"
+        train_labels = candidate / "train" / "labels"
+
+        if train_images.is_dir() and train_labels.is_dir():
+            return candidate
+
+    raise ValueError(
+        "Could not find train/images and train/labels. "
+        "Please upload a YOLO-format dataset."
+    )
+
+
+def install_dataset(zip_file):
+
+    temporary_dir = APP_DIR / "dataset_upload"
+
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir)
+
+    temporary_dir.mkdir(exist_ok=True)
+
+    extracted = safe_extract_dataset(zip_file)
+    root = find_dataset_root(extracted)
+
+    # Support both "valid" and "val"
+    if not (root / "val").exists() and (root / "valid").exists():
+        (root / "valid").rename(root / "val")
+
+    # Training and validation folders are required
+    for split in ["train", "val"]:
+
+        if not (root / split / "images").is_dir():
+            raise ValueError(f"Missing {split}/images folder.")
+
+        if not (root / split / "labels").is_dir():
+            raise ValueError(f"Missing {split}/labels folder.")
+
+    if DATASET_DIR.exists():
+        shutil.rmtree(DATASET_DIR)
+
+    shutil.copytree(root, DATASET_DIR)
+
+    # Generate our own configuration.
+    # Dataset class IDs must match CLASSES.
+    config = {
+        "path": str(DATASET_DIR.resolve()),
+        "train": "train/images",
+        "val": "val/images",
+        "names": {
+            index: name for index, name in enumerate(CLASSES)
+        }
+    }
+
+    if (DATASET_DIR / "test" / "images").is_dir():
+        config["test"] = "test/images"
+
+    config_path = APP_DIR / "data.yaml"
+
+    with open(config_path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, sort_keys=False)
+
+    return config_path
+
+
+# =====================================================
+# DATASET VALIDATION
+# =====================================================
+
+def validate_dataset():
+
+    errors = []
+    summary = {}
+
+    for split in ["train", "val", "test"]:
+
+        image_folder = DATASET_DIR / split / "images"
+        label_folder = DATASET_DIR / split / "labels"
+
+        if not image_folder.exists() or not label_folder.exists():
+
+            if split == "test":
+                continue
+
+            errors.append(f"Missing {split} images or labels.")
+            continue
+
+        images = [
+            file for file in image_folder.iterdir()
+            if file.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+
+        summary[split] = len(images)
+
+        for image in images:
+
+            label = label_folder / (image.stem + ".txt")
+
+            if not label.exists():
+                errors.append(f"Missing label: {label.name}")
+                continue
+
+            try:
+
+                with Image.open(image) as im:
+                    im.verify()
+
+                lines = label.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+
+                for line_number, line in enumerate(lines, 1):
+
+                    if not line.strip():
+                        continue
+
+                    values = line.split()
+
+                    if len(values) != 5:
+                        raise ValueError("Expected five YOLO values.")
+
+                    class_value = float(values[0])
+
+                    if not class_value.is_integer():
+                        raise ValueError("Class ID must be an integer.")
+
+                    class_id = int(class_value)
+
+                    if not 0 <= class_id < len(CLASSES):
+                        raise ValueError(
+                            f"Invalid class ID {class_id}."
+                        )
+
+                    coords = [float(v) for v in values[1:]]
+
+                    if not all(np.isfinite(v) for v in coords):
+                        raise ValueError("Coordinates must be finite.")
+
+                    if not all(0 <= v <= 1 for v in coords):
+                        raise ValueError(
+                            "YOLO coordinates must be between 0 and 1."
+                        )
+
+                    if coords[2] <= 0 or coords[3] <= 0:
+                        raise ValueError("Box width and height must be positive.")
+
+                    if (
+                        coords[0] - coords[2] / 2 < 0
+                        or coords[0] + coords[2] / 2 > 1
+                        or coords[1] - coords[3] / 2 < 0
+                        or coords[1] + coords[3] / 2 > 1
+                    ):
+                        raise ValueError("Bounding box extends outside image.")
+
+            except Exception as error:
+                errors.append(
+                    f"{image.name}, line {line_number if 'line_number' in locals() else '?'}: {error}"
+                )
+
+    return summary, errors
+
+
+# =====================================================
+# TRAINING FUNCTION
+# =====================================================
+
+def train_model(epochs, image_size, batch_size):
+
+    config_path = APP_DIR / "data.yaml"
+
+    if not config_path.exists():
+        raise FileNotFoundError("Upload a dataset first.")
+
+    # GPU is used automatically if CUDA is available.
+    import torch
+    
+    device = 0 if torch.cuda.is_available() else "cpu"
+
+    st.write(f"Training device: **{device}**")
+
+    # Load pretrained YOLO11 model.
+    model = YOLO("yolo11n.pt")
+
+    # Train on the uploaded dataset.
+    model.train(
+        data=str(config_path),
+        epochs=epochs,
+        imgsz=image_size,
+        batch=batch_size,
+        device=device,
+        workers=2,
+        patience=20,
+        pretrained=True,
+        project=str(RUN_DIR),
+        name="blueprint",
+        exist_ok=True,
+        plots=True,
+        save=True
+    )
+
+    best_weights = (
+        RUN_DIR /
+        "blueprint" /
+        "weights" /
+        "best.pt"
+    )
+
+    if not best_weights.exists():
+        raise FileNotFoundError(
+            "Training finished but best.pt was not created."
+        )
+
+    shutil.copy2(best_weights, MODEL_PATH)
+
+    # Clear cached old model.
+    load_model.clear()
+
+    return MODEL_PATH
+
+
+# =====================================================
+# BLUEPRINT IMAGE DETECTION
+# =====================================================
+
+def inspect_blueprint(image, model, confidence, image_size):
+
+    rgb = np.array(image.convert("RGB"))
+
+    results = model.predict(
+        source=rgb,
+        conf=confidence,
+        imgsz=image_size,
+        verbose=False
+    )
+
+    result = results[0]
+
+    # YOLO returns BGR; PIL expects RGB.
+    annotated = result.plot()[..., ::-1]
+
+    annotated_image = Image.fromarray(annotated)
+
+    detections = []
+
+    if result.boxes is not None:
+
+        for box in result.boxes:
+
+            class_id = int(box.cls.item())
+            score = float(box.conf.item())
+
+            coords = [
+                round(float(value), 2)
+                for value in box.xyxy[0].tolist()
+            ]
+
+            class_name = result.names.get(
+                class_id,
+                f"class_{class_id}"
+            )
+
+            detections.append({
+                "Category": class_name,
+                "Confidence": round(score, 4),
+                "X1": coords[0],
+                "Y1": coords[1],
+                "X2": coords[2],
+                "Y2": coords[3]
+            })
+
+    return annotated_image, detections
+
+
+# =====================================================
+# PDF READING
+# =====================================================
+
+def read_pdf(pdf_bytes):
+
+    import fitz
+
+    pages = []
+
+    document = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
+
+    for index, page in enumerate(document):
+
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(2, 2),
+            alpha=False
+        )
+
+        image = Image.open(
+            io.BytesIO(pix.tobytes("png"))
+        ).convert("RGB")
+
+        pages.append((
+            f"Page {index + 1}",
+            image
+        ))
+
+    return pages
+
+
+# =====================================================
+# SIDEBAR
+# =====================================================
+
+with st.sidebar:
+
+    st.title("⚙️ BLUEPRINTAI")
+
+    section = st.radio("select function",
+        [
+            "Blueprint Inspection",
+            "Train AI Model",
+            "Model Information"
+        ]
+    )
+
+    st.divider()
+
+    st.caption("BlueprintAI Machine Learning Prototype")
+
+
+# =====================================================
+# TRAINING PAGE
+# =====================================================
+if section == "Train AI Model":
+    st.write(
+        "Upload a labeled YOLO dataset ZIP to train "
+        "the blueprint detection model."
+    )
+
+    st.info(
+        "The dataset must contain train/images, train/labels, "
+        "val/images and val/labels. A test split is optional."
+    )
+
+    dataset_zip = st.file_uploader(
+        "Upload YOLO dataset ZIP",
+        type=["zip"]
+    )
+
+    if st.button("Import Dataset", type="primary"):
+        if dataset_zip is None:
+                st.error("Please upload a dataset ZIP file first.")
+        else:
+            try:  
+                
+                with st.spinner("Importing dataset..."):
+
+                    config = install_dataset(dataset_zip)
+
+                st.success("Dataset imported successfully.")
+
+                st.write(f"Configuration: `{config}`")
+
+            except Exception as error:
+                st.error(str(error))
+
+    if DATASET_DIR.exists():
+
+        st.divider()
+        st.subheader("Dataset validation")
+
+        if st.button("Check Dataset"):
+
+            summary, errors = validate_dataset()
+
+            for split, count in summary.items():
+                st.write(f"{split.title()} images: {count}")
+
+            if errors:
+                st.error(
+                    f"Found {len(errors)} dataset problems."
+                )
+
+                for error in errors[:20]:
+                    st.write(f"- {error}")
+
+            else:
+                st.success("Dataset validation passed.")
+
+    st.divider()
+
+    st.subheader("Training settings")
+
+    epochs = st.slider(
+        "Training epochs",
+        10,
+        200,
+        100,
+        step=10
+    )
+
+    image_size = st.selectbox(
+        "Image size",
+        [640, 768, 896, 1024],
+        index=2
+    )
+
+    batch_size = st.selectbox(
+        "Batch size",
+        [1, 2, 4, 8],
+        index=2
+    )
+
+    if st.button("🚀 Start AI Training", type="primary"):
+    
+        if not DATASET_DIR.exists():
+            st.error("Import a dataset before training.")
+
+        else:
+
+            summary, errors = validate_dataset()
+
+            if errors:
+                st.error(
+                    "Fix dataset errors before training. "
+                    f"First problem: {errors[0]}"
+                )
+
+            else:
+
+                try:
+
+                    with st.spinner(
+                        "Training BlueprintAI. This may take a while..."
+                    ):
+
+                        trained_path = train_model(
+                            epochs,
+                            image_size,
+                            batch_size
+                        )
+
+                    st.success("AI training completed!")
+
+                    st.write(
+                        f"Model saved: `{trained_path}`"
+                    )
+
+                except Exception as error:
+                    st.exception(error)
+
+
+# =====================================================
+# INSPECTION PAGE
+# =====================================================
+
+elif section == "Blueprint Inspection":
+
+    st.header("🔍 Blueprint Visual Inspection")
+
+    model = get_model()
+
+    if model is None:
+
+        st.warning(
+            "No trained model found. Train the model first "
+            "or place your trained weights at models/best.pt."
+        )
+
+    else:
+        st.success("Trained AI model loaded.")
+
+    confidence = st.slider(
+        "Detection confidence threshold",
+        0.10,
+        0.95,
+        0.35,
+        0.05
+    )
+
+    image_size = st.selectbox(
+        "Inspection resolution",
+        [640, 768, 896, 1024],
+        index=2
+    )
+
+    input_type = st.radio(
+        "Input type",
+        ["Upload Image", "Camera", "Upload PDF"],
+        horizontal=True
+    )
+
+    uploaded = None
+
+    if input_type == "Upload Image":
+
+        uploaded = st.file_uploader(
+            "Upload blueprint image",
+            type=["jpg", "jpeg", "png", "webp"]
+        )
+
+    elif input_type == "Camera":
+
+        uploaded = st.camera_input(
+            "Take a blueprint picture"
+        )
+
+    else:
+
+        uploaded = st.file_uploader(
+            "Upload blueprint PDF",
+            type=["pdf"]
+        )
+
+    if uploaded is not None:
+
+        try:
+
+            file_bytes = uploaded.getvalue()
+
+            if input_type == "Upload PDF":
+
+                pages = read_pdf(file_bytes)
+
+            else:
+
+                image = Image.open(
+                    io.BytesIO(file_bytes)
+                ).convert("RGB")
+
+                pages = [("Uploaded Image", image)]
+
+            all_detections = []
+
+            st.divider()
+
+            for page_name, image in pages:
+
+                st.subheader(page_name)
+
+                left, right = st.columns(2)
+
+                with left:
+
+                    st.image(
+                        image,
+                        caption="Original blueprint",
+                        use_container_width=True
+                    )
+
+                with right:
+
+                    if model is None:
+
+                        st.info(
+                            "Train a model to enable detection."
+                        )
+
+                    else:
+
+                        with st.spinner("Inspecting blueprint..."):
+
+                            annotated, detections = inspect_blueprint(
+                                image,
+                                model,
+                                confidence,
+                                image_size
+                            )
+
+                        st.image(
+                            annotated,
+                            caption="AI visual inspection",
+                            use_container_width=True
+                        )
+
+                        for item in detections:
+                            item["Page"] = page_name
+
+                        all_detections.extend(detections)
+
+                        st.metric(
+                            "Visual flags detected",
+                            len(detections)
+                        )
+
+                st.divider()
+
+            if model is not None:
+
+                st.header("📊 Inspection Summary")
+
+                if all_detections:
+
+                    df = pd.DataFrame(all_detections)
+
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "Total visual flags",
+                        len(df)
+                    )
+
+                    c2.metric(
+                        "Different categories",
+                        df["Category"].nunique()
+                    )
+
+                    c3.metric(
+                        "Average confidence",
+                        f"{df['Confidence'].mean():.1%}"
+                    )
+
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.subheader("Detection categories")
+
+                    st.bar_chart(
+                        df["Category"].value_counts()
+                    )
+
+                    st.divider()
+
+                    st.subheader("Download results")
+
+                    st.download_button(
+                        "Download CSV",
+                        df.to_csv(index=False).encode("utf-8"),
+                        "blueprintai_results.csv",
+                        "text/csv"
+                    )
+
+                    st.download_button(
+                        "Download JSON",
+                        json.dumps(
+                            all_detections,
+                            indent=4
+                        ).encode("utf-8"),
+                        "blueprintai_results.json",
+                        "application/json"
+                    )
+
+                else:
+
+                    st.success(
+                        "No visual flags detected above the selected threshold."
+                    )
+
+                    st.caption(
+                        "This does not prove the blueprint is free of errors."
+                    )
+
+        except Exception as error:
+
+            st.error(
+                f"Could not process the uploaded file: {error}"
+            )
+
+
+    st.header("🧠 Model Information")
+
+    st.write("### Detection categories")
+
+    for index, category in enumerate(CLASSES):
+        st.write(f"{index}. {category}")
+
+    st.divider()
+
+    if MODEL_PATH.exists():
+
+        st.success("Trained model is available.")
+
+        st.write(
+            f"Model location: `{MODEL_PATH}`"
+        )
+
+        st.write(
+            f"Model size: {MODEL_PATH.stat().st_size / (1024 * 1024):.2f} MB"
+        )
+
+    else:
+
+        st.warning("No trained model installed.")
+
+    st.write("### Technology")
+
+    st.write("""
+    - Python
+    - YOLO11
+    - Ultralytics
+    - PyTorch
+    - OpenCV
+    - Streamlit
+    - Pillow
+    - PyMuPDF
+    - Pandas
+    """)
+
+    st.divider()
+
+    st.caption(
+        "This application uses a pre-trained YOLO11 model for visual flag detection.")
